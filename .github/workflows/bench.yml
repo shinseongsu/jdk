@@ -1,0 +1,61 @@
+name: indexOf bench (JDK-8392735)
+
+on:
+  push:
+    branches: [ 'pr/bench-*' ]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU info
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          grep -o -w 'avx2\|avx512f\|avx512bw' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y autoconf zip unzip file libasound2-dev libcups2-dev \
+            libfontconfig1-dev libx11-dev libxext-dev libxrender-dev libxrandr-dev libxtst-dev libxt-dev
+
+      - name: Boot JDK 27
+        run: |
+          curl -sL -o /tmp/boot.tgz https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_linux-x64_bin.tar.gz
+          echo "95fc37eb3a18a27a26d5904c2d89d52bace8dafa9a078ca27f4747fbc4bf070b  /tmp/boot.tgz" | sha256sum -c
+          mkdir -p /tmp/boot && tar xzf /tmp/boot.tgz -C /tmp/boot --strip-components=1
+
+      - name: Build and benchmark each ref
+        run: |
+          mkdir -p results
+          while read -r label repo ref; do
+            [ -z "$label" ] && continue
+            case "$label" in \#*) continue;; esac
+            echo "::group::build $label ($repo@$ref)"
+            rm -rf /tmp/src && git init -q /tmp/src && cd /tmp/src
+            git fetch -q --depth 1 "https://github.com/$repo.git" "$ref" && git checkout -q FETCH_HEAD
+            git log -1 --format='%H %s' | tee "$GITHUB_WORKSPACE/results/$label-commit.txt"
+            bash make/devkit/createJMHBundle.sh > /dev/null
+            bash configure -q --with-boot-jdk=/tmp/boot --with-jmh=build/jmh/jars > /dev/null
+            make -s images build-microbenchmark > /dev/null
+            echo "::endgroup::"
+            B=$(ls -d build/*/images)
+            echo "::group::run $label"
+            for i in 1 2 3; do $B/jdk/bin/java "$GITHUB_WORKSPACE/bench/Z.java" 2>&1 | tail -3; done | tee "$GITHUB_WORKSPACE/results/$label-Z.txt"
+            $B/jdk/bin/java -jar $B/test/micro/benchmarks.jar \
+              'StringIndexOf\.(searchCharLongSuccess|searchChar16LongSuccess|searchString16(Long|Medium|Short)LatinSuccess|searchString16(Long|Medium|Short)WithOffsetLatinSuccess|searchString16LongSuccess|success|advancedWithShortSub1|advancedWithShortSub2)$' \
+              -f 3 -wi 5 -i 5 -rf text -rff "$GITHUB_WORKSPACE/results/$label-jmh.txt" | tail -25
+            echo "::endgroup::"
+            cd "$GITHUB_WORKSPACE"
+            rm -rf /tmp/src
+          done < bench/refs.txt
+          for f in results/*; do echo "===== $f"; cat "$f"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results/
